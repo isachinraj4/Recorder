@@ -1,4 +1,4 @@
-# Recorder
+# AceRec
 
 A simple Android voice recorder built with Kotlin and Jetpack Compose.
 
