@@ -105,6 +105,13 @@ class RecordingService : Service() {
         }
     }
 
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        // Swiping the app away from Recents must not stop an active recording. A started
+        // foreground service is not bound to the task, so we deliberately keep it (and its
+        // ongoing notification) alive here and let recording continue until the user taps Stop.
+        super.onTaskRemoved(rootIntent)
+    }
+
     override fun onDestroy() {
         stop()
         super.onDestroy()
