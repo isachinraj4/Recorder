@@ -3,12 +3,14 @@ package com.acetrader.recorder
 import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -27,6 +29,7 @@ import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
+import androidx.compose.material3.FabPosition
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -36,7 +39,6 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
-import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -55,6 +57,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlinx.coroutines.delay
 import java.io.File
 import java.text.DateFormat
@@ -78,60 +81,79 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun RecorderScreen() {
     val context = LocalContext.current
-    val recorder = remember { AudioRecorder(context) }
-    DisposableEffect(Unit) { onDispose { recorder.release() } }
+    val player = remember { Player() }
+    DisposableEffect(Unit) { onDispose { player.stop() } }
 
-    var recordings by remember { mutableStateOf(recorder.recordings()) }
-    var isRecording by remember { mutableStateOf(false) }
+    val isRecording by RecordingService.State.isRecording.collectAsStateWithLifecycle()
+    val startedAt by RecordingService.State.startTime.collectAsStateWithLifecycle()
+
+    var recordings by remember { mutableStateOf(Recordings.list(context)) }
     var elapsed by remember { mutableLongStateOf(0L) }
     var playing by remember { mutableStateOf<File?>(null) }
     var pendingDelete by remember { mutableStateOf<File?>(null) }
 
-    fun start() {
-        recorder.stopPlayback()
-        playing = null
-        try {
-            recorder.startRecording()
-            isRecording = true
-        } catch (e: Exception) {
-            Toast.makeText(context, "Could not start recording", Toast.LENGTH_SHORT).show()
-        }
-    }
-
-    fun stop() {
-        recorder.stopRecording()
-        isRecording = false
-        recordings = recorder.recordings()
-    }
-
-    val permissionLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { granted ->
-        if (granted) start()
-        else Toast.makeText(context, "Microphone permission is needed to record", Toast.LENGTH_LONG).show()
-    }
-
+    // Refresh the list whenever a recording finishes.
     LaunchedEffect(isRecording) {
-        elapsed = 0L
-        val startedAt = System.currentTimeMillis()
+        if (!isRecording) recordings = Recordings.list(context)
+    }
+
+    // Tick the timer from the service's start time, so it stays correct after reopening the app.
+    LaunchedEffect(isRecording, startedAt) {
         while (isRecording) {
             elapsed = System.currentTimeMillis() - startedAt
             delay(200)
         }
+        if (!isRecording) elapsed = 0L
+    }
+
+    fun startRecording() {
+        player.stop()
+        playing = null
+        RecordingService.start(context)
+    }
+
+    val recordPermission = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) startRecording()
+        else Toast.makeText(context, "Microphone permission is needed to record", Toast.LENGTH_LONG).show()
+    }
+
+    // On Android 13+ the recording notification needs this permission; recording still works
+    // without it, but the notification (and its Stop button) won't appear.
+    val notifPermission = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { /* result ignored; handled before starting */ }
+
+    fun ensureNotifPermission() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            notifPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
+
+    fun onRecordButton() {
+        if (isRecording) {
+            RecordingService.stop(context)
+            return
+        }
+        ensureNotifPermission()
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            startRecording()
+        } else {
+            recordPermission.launch(Manifest.permission.RECORD_AUDIO)
+        }
     }
 
     Scaffold(
-        floatingActionButtonPosition = androidx.compose.material3.FabPosition.Center,
+        floatingActionButtonPosition = FabPosition.Center,
         floatingActionButton = {
             FloatingActionButton(
-                onClick = {
-                    when {
-                        isRecording -> stop()
-                        ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
-                            PackageManager.PERMISSION_GRANTED -> start()
-                        else -> permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
-                    }
-                },
+                onClick = { onRecordButton() },
                 containerColor = MaterialTheme.colorScheme.primary,
                 modifier = Modifier.size(80.dp)
             ) {
@@ -165,7 +187,8 @@ fun RecorderScreen() {
                         else MaterialTheme.colorScheme.onBackground
                     )
                     Text(
-                        text = if (isRecording) "Recording…" else "Tap the mic to record",
+                        text = if (isRecording) "Recording… (continues in the background)"
+                        else "Tap the mic to record",
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -190,14 +213,14 @@ fun RecorderScreen() {
                 items(recordings, key = { it.name }) { file ->
                     RecordingRow(
                         file = file,
-                        durationMillis = remember(file) { recorder.durationMillis(file) },
+                        durationMillis = remember(file) { Recordings.durationMillis(file) },
                         isPlaying = playing == file,
                         onPlayToggle = {
                             if (playing == file) {
-                                recorder.stopPlayback()
+                                player.stop()
                                 playing = null
                             } else if (!isRecording) {
-                                if (recorder.play(file) { playing = null }) {
+                                if (player.play(file) { playing = null }) {
                                     playing = file
                                 } else {
                                     Toast.makeText(context, "Could not play recording", Toast.LENGTH_SHORT).show()
@@ -222,11 +245,11 @@ fun RecorderScreen() {
             confirmButton = {
                 TextButton(onClick = {
                     if (playing == file) {
-                        recorder.stopPlayback()
+                        player.stop()
                         playing = null
                     }
                     file.delete()
-                    recordings = recorder.recordings()
+                    recordings = Recordings.list(context)
                     pendingDelete = null
                 }) { Text("Delete") }
             },
